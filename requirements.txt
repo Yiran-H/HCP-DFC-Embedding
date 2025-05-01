@@ -1,0 +1,17 @@
+python-dotenv==1.0.1
+h5py==3.13.0
+numpy==2.2.5
+pandas==2.2.3
+scikit-learn==1.6.1
+torch==2.6.0
+torch-geometric==2.6.1
+matplotlib==3.10.1
+einops==0.8.1
+scipy
+torchvision
+torchaudio
+networkx
+tqdm
+ray[tune]==2.44.1
+mamba-ssm[causal-conv1d]
+triton==3.2.0

@@ -1,0 +1,42 @@
+{
+    "batch_size": 16,
+    "learning_rate": 0.001,
+    "weight_decay": 0.0001,
+    "epochs": 100,
+    "seed": 42,
+    "step_size": 10,
+    "gamma": 0.5,
+    "dim_out": 64,
+    "dim_in": 92,
+    "dim_val": 256,
+    "dim_attn": 256,
+    "n_heads": 1,
+    "n_encoder_layers": 1,
+    "lookback": 2,
+    "dropout": 0.1,
+    "patience": 10,
+
+    "saved_model_path": "./models/saved_model_path",
+
+    "GDGMamba1": {
+        "d_model": 92,
+        "d_state": 6,
+        "d_conv": 3
+    },
+    "GDGMamba2": {
+        "d_model": 96,
+        "d_state": 64,
+        "d_conv": 4,
+        "headdim": 16
+    },
+    "data": {
+      "dataset": "hcp1003", 
+      "dataset_path": {
+        "hcp1003": "./hcp1003_RestALL_Schaefer_tcCLEAN.mat",
+        "my_custom_data": "./my_custom_data.mat"
+      },
+      "fc_key": "FCmats",
+      "ts_key": "tc_clean"
+    }
+  }
+  
