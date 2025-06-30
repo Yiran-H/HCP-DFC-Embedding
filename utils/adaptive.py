@@ -3,10 +3,14 @@ import networkx as nx
 import matplotlib.pyplot as plt
 import random
 import torch
+from utils.prepare_data import load_config
+
+
+config = load_config()
 
 def set_seed(seed=42):
     np.random.seed(seed)
-    random.seed(seed)
+    random.seed(seed)   
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
@@ -50,7 +54,7 @@ def compute_novelty_index(dynfc_matrices):
 
 # ========================= Quantile Binning for Adaptive Lookback ========================= #
 
-def quantile_binning(novelties, min_lookback=1, max_lookback=5):
+def quantile_binning(novelties, min_lookback=0, max_lookback=config["max_lb"]):
     """
     Map novelty indices to adaptive lookback values using quantile binning.
 
@@ -74,7 +78,10 @@ def quantile_binning(novelties, min_lookback=1, max_lookback=5):
     for n in novelties:
         for i in range(num_bins):
             if quantiles[i] <= n <= quantiles[i + 1]:
-                lookbacks.append(min_lookback + i)
+                if config["adaptive_type"]:
+                    lookbacks.append(min_lookback + i)
+                else:
+                    lookbacks.append(max_lookback - i)
                 break
     return lookbacks
 
@@ -120,3 +127,4 @@ def plot_adaptive_lookback_vs_novelty(novelty_indices, adaptive_lookbacks):
 
     plt.tight_layout()
     plt.show()
+

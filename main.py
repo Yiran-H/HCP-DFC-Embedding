@@ -1,9 +1,9 @@
 import numpy as np
 import torch
-import json
 from utils.prepare_data import *
 from models.GDGMamba import *
 from utils.HPCDataset import *
+from utils.link_prediction import *
 
 from torch.optim import Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
@@ -13,215 +13,207 @@ from imblearn.over_sampling import RandomOverSampler
 import matplotlib.pyplot as plt
 import time
 
-# Load config
-def load_config(path="config.json"):
-    with open(path, "r") as f:
-        return json.load(f)
-
+    
 # Load dataset and prepare FC matrix
 def load_dataset(config):
     dataset = HPCDataset(
         mat_file_path=config["data"]["dataset_path"]["hcp1003"],
         fc_key="FCmats",
         ts_key="tc_clean",
-        threshold=0.4,
-        window_size=100,
-        step_size=10,
-        selected_sessions=[0]
+        threshold=config["threshold"],
+        window_size=config["window_size"],
+        step_size=config["stride"],
+        selected_sessions=[0,1,2,3],
+        subject_num=config["num_subjects"]
     )
     _, _, binary_graph = dataset[0]
     return np.array(binary_graph)
 
-# Prepare training, validation, test data
-def split_data(dataset, lookback, binary_graph, device):
-    train_size = int(0.7 * len(binary_graph))
-    val_size = int(0.2 * len(binary_graph))
+def optimise_mamba(data, config):
 
-    train_end = lookback + train_size
-    val_start = train_end
-    val_end = val_start + val_size
-    test_start = val_end
-    test_end = len(binary_graph)
+    # model = MambaG2G1(config["GDGMamba1"], config["dim_in"], config["dim_out"], dropout=config["dropout"]).to(device)
+    model = MambaG2G2(config["GDGMamba2"], config["GDGMamba2"]["d_model"], config["dim_out"], dropout=config["dropout"]).to(device)
+    print('Total parameters:', sum(p.numel() for p in model.parameters()))
 
-    train_data = {i: torch.tensor(dataset[i], dtype=torch.float32).to(device) for i in range(lookback, train_end)}
-    val_data = {i: torch.tensor(dataset[i], dtype=torch.float32).to(device) for i in range(val_start, val_end)}
-    test_data = {i: torch.tensor(dataset[i], dtype=torch.float32).to(device) for i in range(test_start, test_end)}
+    dataset = RMDataset(data, config["lookback"])
 
-    print(f"Training Data: {lookback} to {train_end}")
-    print(f"Validation Data: {val_start} to {val_end}")
-    print(f"Test Data: {test_start} to {test_end}")
-
-    return train_data, val_data, test_data
-
-# Training loop with early stopping and scheduler
-def train_model(model, optimizer, scheduler, train_data, val_data, epochs, weight_decay, device, patience, hop_dict, scale_terms_dict):
+    optimizer = torch.optim.Adam(model.parameters(), lr=config["learning_rate"], weight_decay=config["weight_decay"])
+    
     loss_mainlist, val_mainlist = [], []
     best_val_loss = float('inf')
     early_stopping_counter = 0
 
-    for e in range(epochs):
-        loss_list = []
-        model.train()
-        for i in train_data.keys():
-            triplet, scale = to_triplets(sample_all_hops(hop_dict[i]), scale_terms_dict[i])
-            optimizer.zero_grad()
-            inputs = train_data[i]
-            _, mu, sigma = model(inputs)
-            loss = build_loss(triplet, scale, mu, sigma, 64, scale=False)
-            l2_reg = torch.tensor(0., device=device)
-            for param in model.parameters():
-                l2_reg += torch.norm(param, p=2)
-            loss += weight_decay * l2_reg
+    start = time.time()
 
-            loss_list.append(loss.item())
+    for e in tqdm(range(50)):
+        model.train()
+        loss_step = []
+        for i in train_indices[train_indices >= lookback]:
+            x, triplet, scale = dataset[i]
+            optimizer.zero_grad()
+            # x = x.clone().detach().requires_grad_(True).to(device)
+            _,mu, sigma = model(x)
+            loss = build_loss(triplet, scale, mu, sigma, config["dim_out"], scale=False)
+
+            loss_step.append(loss.cpu().detach().numpy())
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
         model.eval()
         val_loss_value = 0.0
         val_samples = 0
-        for i in val_data.keys():
-            triplet, scale = to_triplets(sample_all_hops(hop_dict[i]), scale_terms_dict[i])
-            inputs = val_data[i]
-            _, mu, sigma = model(inputs)
-            val_loss_value += build_loss(triplet, scale, mu, sigma, 64, scale=False).item()
-            val_samples += 1
+        with torch.no_grad():
+            for i in val_indices:
+                x, triplet, scale = dataset[i]
+                _, mu, sigma = model(x)
+                val_loss_value += build_loss(triplet, scale, mu, sigma, config["dim_out"], scale=False).item()
+                val_samples += 1
         val_loss_value /= val_samples
 
-        loss_mainlist.append(np.mean(loss_list))
+        loss_mainlist.append(np.mean(loss_step))
         val_mainlist.append(val_loss_value)
         print(f"Epoch: {e}, Average Training Loss: {loss_mainlist[-1]}, Validation Loss: {val_mainlist[-1]}")
-
-        scheduler.step(val_loss_value)
 
         if val_loss_value < best_val_loss:
             best_val_loss = val_loss_value
             early_stopping_counter = 0
-            torch.save(model.state_dict(), config["saved_model_path"])
+
+            save_path = f"./models/lookback_{lookback}/dim_out_{config['dim_out']}/model_100_ratio.pth"
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+            torch.save(model.state_dict(), save_path)
         else:
             early_stopping_counter += 1
-            if early_stopping_counter >= patience:
+            if early_stopping_counter >= config["patience"]:
                 print("Early stopping triggered")
                 break
+    print("Training Time taken: ", time.time() - start)
 
-    return loss_mainlist, val_mainlist
-
-def plot_loss_curves(train_losses, val_losses):
-    plt.figure(figsize=(6, 4))
-    plt.semilogy(train_losses, label='Training Loss')
-    plt.semilogy(val_losses, label='Validation Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.title('Training and Validation Loss (Semilogy)')
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig("./results/plot/loss_curve_semilogy.png", dpi=300)
-    plt.show()
-
-# Evaluate test loss
-def evaluate_test_loss(model, test_data, hop_dict, scale_terms_dict):
-    model.eval()
-    test_loss_value = 0.0
-    test_samples = 0
-    with torch.no_grad():
-        for i in test_data.keys():
-            triplet, scale = to_triplets(sample_all_hops(hop_dict[i]), scale_terms_dict[i])
-            inputs = test_data[i]
-            _, mu, sigma = model(inputs)
-            test_loss_value += build_loss(triplet, scale, mu, sigma, 64, scale=False).item()
-            test_samples += 1
-    return test_loss_value / test_samples
-
-# Compute MAP and MRR
-def compute_map_mrr(model, test_data, binary_graph, device):
-    embeddings_list, labels_list = [], []
-    for i in test_data.keys():
-        inputs = test_data[i]
-        with torch.no_grad():
-            _, embeddings, _ = model(inputs.to(device))
-        embeddings_flat = embeddings.cpu().numpy().reshape(-1, embeddings.shape[-1])
-        embeddings_list.append(embeddings_flat)
-        labels_list.append(np.array(binary_graph)[i].astype(int).flatten())
-
-    X = np.concatenate(embeddings_list, axis=0)
-    y = np.concatenate(labels_list, axis=0)[:X.shape[0]]
-
-    X, y = RandomOverSampler(random_state=42).fit_resample(X, y)
-    clf = MLPClassifier(hidden_layer_sizes=(100, 50), max_iter=300, random_state=123)
-    clf.fit(X, y)
-
-    AP_list, RR_list = [], []
-    for i in test_data.keys():
-        inputs = test_data[i]
-        with torch.no_grad():
-            _, embeddings, _ = model(inputs.to(device))
-        X_test = embeddings.cpu().numpy().reshape(-1, embeddings.shape[-1])
-        y_score = clf.predict_proba(X_test)[:, 1]
-        y_true = np.array(binary_graph)[i].astype(int).flatten()[:len(y_score)]
-
-        precision, recall, _ = precision_recall_curve(y_true, y_score)
-        AP_list.append(auc(recall, precision))
-
-        true_indices = np.where(y_true == 1)[0]
-        if len(true_indices) == 0:
-            RR_list.append(0.0)
-        else:
-            sorted_indices = np.argsort(y_score)[::-1]
-            for rank, idx in enumerate(sorted_indices, 1):
-                if idx in true_indices:
-                    RR_list.append(1.0 / rank)
-                    break
-            else:
-                RR_list.append(0.0)
-
-    MAP = np.mean(AP_list)
-    MRR = np.mean(RR_list)
-    return MAP, MRR
+    return model
 
 
-def main():
-    config = load_config()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+config = load_config()
+lookback = config["lookback"]
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+
+if os.path.exists("binary_graph_100_ratio.npy"):
+    binary_graph = np.load("binary_graph_100_ratio.npy")
+else:
     binary_graph = load_dataset(config)
-    dataset, hop_dict, scale_terms_dict, _, _ = prepare_data(binary_graph, config["lookback"])
+    np.save("binary_graph_100_ratio.npy", binary_graph)
 
-    train_data, val_data, test_data = split_data(dataset, config["lookback"], binary_graph, device)
+num_graph_per_sub = binary_graph.shape[0] // config["num_subjects"]
+print("binary_graph:", binary_graph.shape)
+print("num_graph_per_sub:", num_graph_per_sub)
+# train_indices, val_indices, test_indices = family_group(num_graph_per_sub)
+train_indices, val_indices, test_indices = split_by_ratio_per_sub(num_graph_per_sub)
 
-    model = MambaG2G1(config["GDGMamba1"], config["dim_in"], config["dim_out"], dropout=config["dropout"]).to(device)
-    print('Total parameters:', sum(p.numel() for p in model.parameters()))
+# for mamba2:
+original_data = np.array(binary_graph)  # shape (111, 92, 92)
+padded_data = np.zeros((len(binary_graph), 96, 96), dtype=original_data.dtype)
+padded_data[:, :92, :92] = original_data
+binary_graph = padded_data
 
-    optimizer = Adam(model.parameters(), lr=config["learning_rate"], weight_decay=config["weight_decay"])
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5, min_lr=1e-8)
+data = binary_tensor_to_data_format(binary_graph)
 
-    start = time.time()
-    train_losses, val_losses = train_model(model, optimizer, scheduler, train_data, val_data,
-                                           config["epochs"],
-                                           config["weight_decay"], device, config["patience"],
-                                           hop_dict, scale_terms_dict)
-    print("Time taken:", time.time() - start)
+model = optimise_mamba(data,config)
+model = MambaG2G2(config["GDGMamba2"], config["GDGMamba2"]["d_model"], config["dim_out"], dropout=config["dropout"]).to(device)
 
-    plot_loss_curves(train_losses, val_losses)
+dataset = RMDataset(data, lookback)
+#read the best_model.pt
+# model.load_state_dict(torch.load('best_model.pth'))
 
-    # Test loss evaluation
-    model.load_state_dict(torch.load(config["saved_model_path"]))
+mu_timestamp = []
+sigma_timestamp = []
+
+save_path = f"./models/lookback_{lookback}/dim_out_{config['dim_out']}/model_100_ratio.pth"
+model.load_state_dict(torch.load(save_path))
+with torch.no_grad():
     model.eval()
-    test_loss = evaluate_test_loss(model, test_data, hop_dict, scale_terms_dict)
-    print(f"Test Loss: {test_loss:.4f}")
+    for i in range(lookback, binary_graph.shape[0]):
+        x, triplet, scale = dataset[i]
+        x = x.clone().detach().requires_grad_(True).to(device)
+        _, mu, sigma = model(x)
+        mu_timestamp.append(mu.cpu().detach().numpy())
+        sigma_timestamp.append(sigma.cpu().detach().numpy())
+name = 'Results/RealityMining'
+save_sigma_mu = True
+sigma_L_arr = []
+mu_L_arr = []
+if save_sigma_mu == True:
+    sigma_L_arr.append(sigma_timestamp)
+    mu_L_arr.append(mu_timestamp)
 
-    # MAP & MRR evaluation
-    MAPs, MRRs = [], []
-    for run in range(5):
-        print(f"Run {run+1}...")
-        MAP, MRR = compute_map_mrr(model, test_data, binary_graph, device)
-        MAPs.append(MAP)
-        MRRs.append(MRR)
+import time
+start = time.time()
+MAPS = []
+MRR = []
 
-    print(f"\n==== Final Results over 5 runs ====")
-    print(f"MAP: Mean = {np.mean(MAPs):.4f}, Variance = {np.var(MAPs):.6f}")
-    print(f"MRR: Mean = {np.mean(MRRs):.4f}, Variance = {np.var(MRRs):.6f}")
+for i in tqdm(range(1)):
+    curr_MAP, curr_MRR = get_MAP_avg(mu_L_arr, sigma_L_arr, lookback,data, train_indices, test_indices)
+    MAPS.append(curr_MAP)
+    MRR.append(curr_MRR)
+#print mean and std of map and mrr
+print("Mean MAP: ", np.mean(MAPS))
+print("Mean MRR: ", np.mean(MRR))
+print("Std MAP: ", np.std(MAPS))
+print("Std MRR: ", np.std(MRR))
+print("Reference Time taken: ", (time.time() - start) / 5)
 
-if __name__ == "__main__":
-    main()
+
+
+
+#
+# def train_model(config):
+#     map_value = optimise_mamba(data,lookback = config['lookback'], dim_in=config['dim_in'], d_conv=config['d_conv'],d_state=config['d_state'],dropout=config['dropout'],lr=config['lr'],weight_decay=config['weight_decay'],walk_length=walk)
+#     return map_value
+#
+#
+# def objective(config):  # ①
+#     while True:
+#         acc = train_model(config)
+#         train.report({"MAP": acc})  # Report to Tunevvvvvvv
+#
+#
+# ray.init(  runtime_env={
+#             "working_dir": str(os.getcwd()),
+#         })  # Initialize Ray
+#
+#
+# search_space = {"lr": tune.loguniform(1e-5, 1e-2)
+#         ,"dim_in": tune.randint(16, 100),
+#         "lookback": tune.randint(1,5),
+#                 "d_conv": tune.randint(2, 10),
+#                 "d_state": tune.randint(2, 50),
+#                 "dropout": tune.uniform(0.1, 0.5),
+#                 "weight_decay": tune.loguniform(1e-5, 1e-3)}
+#
+# # Create an Optuna search space
+# algo = OptunaSearch(
+# )
+#
+#
+# tuner = tune.Tuner(  # ③
+#     tune.with_resources(
+#         tune.with_parameters(objective),
+#         resources={"gpu": 0.25}
+#     ),
+#     tune_config=tune.TuneConfig(
+#         metric="MAP",
+#         mode="max",
+#         search_alg=algo,
+#         num_samples=100
+#     ),
+#     param_space=search_space,
+#     run_config=train.RunConfig(
+#         stop={"training_iteration": 1}  # Limit the training iterations to 1
+#     )
+# )
+#
+# results = tuner.fit()
+# print("Best config is:", results.get_best_result().config)
+
+#{'lr': 2.6152417925517384e-05, 'dim_in': 71, 'lookback': 4, 'd_conv': 8, 'd_state': 6, 'dropout': 0.14669919601710057, 'weight_decay': 3.427957936022128e-05}
+
