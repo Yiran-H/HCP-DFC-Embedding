@@ -23,6 +23,7 @@
     "stride": 10,
     "adaptive_type": 1, 
     "threshold": 0.4,
+    "max_lb": 5,
 
     "saved_model_path": "./models/",
     "twins_path": "./twins.csv",
