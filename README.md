@@ -15,5 +15,5 @@ conda create --name py39 --file requirements.txt -c pytorch -c nvidia
 conda install -c nvidia cuda-nvcc=11.8
 pip install --no-build-isolation mamba-ssm[causal-conv1d]
 pip install ray h5py imblearn optuna
-
+pip install wandb
 ```
