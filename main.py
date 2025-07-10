@@ -12,8 +12,9 @@ from sklearn.neural_network import MLPClassifier
 from imblearn.over_sampling import RandomOverSampler
 import matplotlib.pyplot as plt
 import time
+import wandb
 
-    
+   
 # Load dataset and prepare FC matrix
 def load_dataset(config):
     dataset = HPCDataset(
@@ -47,7 +48,7 @@ def optimise_mamba(data, config):
 
     for e in tqdm(range(50)):
         model.train()
-        loss_step = []
+        # loss_step = []
         for i in train_indices[train_indices >= lookback]:
             x, triplet, scale = dataset[i]
             optimizer.zero_grad()
@@ -55,7 +56,7 @@ def optimise_mamba(data, config):
             _,mu, sigma = model(x)
             loss = build_loss(triplet, scale, mu, sigma, config["dim_out"], scale=False)
 
-            loss_step.append(loss.cpu().detach().numpy())
+            # loss_step.append(loss.cpu().detach().numpy())
             loss.backward()
             clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
@@ -63,23 +64,40 @@ def optimise_mamba(data, config):
         model.eval()
         val_loss_value = 0.0
         val_samples = 0
+
+        train_loss_value = 0.0
+        train_samples = 0
         with torch.no_grad():
+            for i in train_indices[train_indices >= lookback]:
+                x, triplet, scale = dataset[i]
+                _, mu, sigma = model(x)
+                train_loss_value += build_loss(triplet, scale, mu, sigma, config["dim_out"], scale=False).item()
+                train_samples += 1
+
             for i in val_indices:
                 x, triplet, scale = dataset[i]
                 _, mu, sigma = model(x)
                 val_loss_value += build_loss(triplet, scale, mu, sigma, config["dim_out"], scale=False).item()
                 val_samples += 1
+        train_loss_value /= train_samples
         val_loss_value /= val_samples
 
-        loss_mainlist.append(np.mean(loss_step))
+        # loss_mainlist.append(np.mean(loss_step))
         val_mainlist.append(val_loss_value)
+        loss_mainlist.append(train_loss_value)
         print(f"Epoch: {e}, Average Training Loss: {loss_mainlist[-1]}, Validation Loss: {val_mainlist[-1]}")
+        run.log({
+            "epoch": e,
+            "average_training_loss": loss_mainlist[-1],
+            "validation_loss": val_mainlist[-1]
+        })
+
 
         if val_loss_value < best_val_loss:
             best_val_loss = val_loss_value
             early_stopping_counter = 0
 
-            save_path = f"./models/lookback_{lookback}/dim_out_{config['dim_out']}/model_100_ratio.pth"
+            save_path = f"./models/lookback_{lookback}/dim_out_{config['dim_out']}/model_100_sess.pth"
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
             torch.save(model.state_dict(), save_path)
@@ -89,7 +107,7 @@ def optimise_mamba(data, config):
                 print("Early stopping triggered")
                 break
     print("Training Time taken: ", time.time() - start)
-
+    run.finish()
     return model
 
 
@@ -97,18 +115,30 @@ config = load_config()
 lookback = config["lookback"]
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# Start a new wandb run to track this script.
+run = wandb.init(
+    # Set the wandb entity where your project will be logged (generally your team name).
+    entity="yirannnn-new-jersey-institute-of-technology",
+    # Set the wandb project where this run will be logged.
+    project="hcp",
+    # Track hyperparameters and run metadata.
+    config=config
+)
 
-if os.path.exists("binary_graph_100_ratio.npy"):
-    binary_graph = np.load("binary_graph_100_ratio.npy")
+data_path = f"binary_graph_20_{config['stride']}_ratio.npy"
+if os.path.exists(data_path):
+    binary_graph = np.load(data_path)
 else:
+    os.makedirs(os.path.dirname(data_path) or ".", exist_ok=True)
     binary_graph = load_dataset(config)
-    np.save("binary_graph_100_ratio.npy", binary_graph)
+    np.save(data_path, binary_graph)
 
 num_graph_per_sub = binary_graph.shape[0] // config["num_subjects"]
 print("binary_graph:", binary_graph.shape)
 print("num_graph_per_sub:", num_graph_per_sub)
 # train_indices, val_indices, test_indices = family_group(num_graph_per_sub)
-train_indices, val_indices, test_indices = split_by_ratio_per_sub(num_graph_per_sub)
+# train_indices, val_indices, test_indices = split_by_ratio_per_sub(num_graph_per_sub)
+train_indices, val_indices, test_indices = split_by_session(num_graph_per_sub // 4)
 
 # for mamba2:
 original_data = np.array(binary_graph)  # shape (111, 92, 92)
@@ -128,7 +158,7 @@ dataset = RMDataset(data, lookback)
 mu_timestamp = []
 sigma_timestamp = []
 
-save_path = f"./models/lookback_{lookback}/dim_out_{config['dim_out']}/model_100_ratio.pth"
+save_path = f"./models/lookback_{lookback}/dim_out_{config['dim_out']}/model_100_sess.pth"
 model.load_state_dict(torch.load(save_path))
 with torch.no_grad():
     model.eval()
@@ -151,7 +181,7 @@ start = time.time()
 MAPS = []
 MRR = []
 
-for i in tqdm(range(1)):
+for i in tqdm(range(5)):
     curr_MAP, curr_MRR = get_MAP_avg(mu_L_arr, sigma_L_arr, lookback,data, train_indices, test_indices)
     MAPS.append(curr_MAP)
     MRR.append(curr_MRR)
@@ -160,7 +190,7 @@ print("Mean MAP: ", np.mean(MAPS))
 print("Mean MRR: ", np.mean(MRR))
 print("Std MAP: ", np.std(MAPS))
 print("Std MRR: ", np.std(MRR))
-print("Reference Time taken: ", (time.time() - start) / 5)
+print("Reference Time taken: ", (time.time() - start)/5)
 
 
 

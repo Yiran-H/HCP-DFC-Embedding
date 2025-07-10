@@ -13,7 +13,7 @@ from sklearn.neural_network import MLPClassifier
 from imblearn.over_sampling import RandomOverSampler
 import matplotlib.pyplot as plt
 import time
-
+import wandb
     
 # Load dataset and prepare FC matrix
 def load_dataset(config):
@@ -46,7 +46,7 @@ def optimise_mamba(data, config):
 
     for e in tqdm(range(50)):
         model.train()
-        loss_step = []
+        # loss_step = []
         for i in train_indices[train_indices >= config["max_lb"]]:
             x, triplet, scale = dataset[i]
             optimizer.zero_grad()
@@ -54,7 +54,7 @@ def optimise_mamba(data, config):
             _,mu, sigma = model(x)
             loss = build_loss(triplet, scale, mu, sigma, config["dim_out"], scale=False)
 
-            loss_step.append(loss.cpu().detach().numpy())
+            # loss_step.append(loss.cpu().detach().numpy())
             loss.backward()
             clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
@@ -62,49 +62,80 @@ def optimise_mamba(data, config):
         model.eval()
         val_loss_value = 0.0
         val_samples = 0
+        
+        train_loss_value = 0.0
+        train_samples = 0
         with torch.no_grad():
+            for i in train_indices[train_indices >= config["max_lb"]]:
+                x, triplet, scale = dataset[i]
+                _, mu, sigma = model(x)
+                train_loss_value += build_loss(triplet, scale, mu, sigma, config["dim_out"], scale=False).item()
+                train_samples += 1
+
             for i in val_indices:
                 x, triplet, scale = dataset[i]
                 _, mu, sigma = model(x)
                 val_loss_value += build_loss(triplet, scale, mu, sigma, config["dim_out"], scale=False).item()
                 val_samples += 1
+        train_loss_value /= train_samples
         val_loss_value /= val_samples
 
-        loss_mainlist.append(np.mean(loss_step))
+        # loss_mainlist.append(np.mean(loss_step))
         val_mainlist.append(val_loss_value)
-        print(f"Epoch: {e}, Average Training Loss: {loss_mainlist[-1]}, Validation Loss: {val_mainlist[-1]}")
+        loss_mainlist.append(train_loss_value)
 
+        print(f"Epoch: {e}, Average Training Loss: {loss_mainlist[-1]}, Validation Loss: {val_mainlist[-1]}")
+        run.log({
+            "epoch": e,
+            "average_training_loss": loss_mainlist[-1],
+            "validation_loss": val_mainlist[-1]
+        })
         if val_loss_value < best_val_loss:
             best_val_loss = val_loss_value
             early_stopping_counter = 0
             
-            save_path = f"./models/adaptive_lookback/{config['adaptive_type']}/model_100_ratio.pth"
+            save_path = f"./models/adaptive_lookback/{config['adaptive_type']}/{config['max_lb']}/{config['stride']}/{threhold}/model_100_sess.pth"
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
-            config["saved_model_path"] = save_path
-            torch.save(model.state_dict(), config["saved_model_path"])
+            torch.save(model.state_dict(), save_path)
         else:
             early_stopping_counter += 1
             if early_stopping_counter >= config["patience"]:
                 print("Early stopping triggered")
                 break
-
+    run.finish()
     return model
 
 
 config = load_config()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# Start a new wandb run to track this script.
+run = wandb.init(
+    # Set the wandb entity where your project will be logged (generally your team name).
+    entity="yirannnn-new-jersey-institute-of-technology",
+    # Set the wandb project where this run will be logged.
+    project="hcp",
+    # Track hyperparameters and run metadata.
+    config=config
+)
 
-if os.path.exists("binary_graph_100_ratio.npy"):
-    binary_graph = np.load("binary_graph_100_ratio.npy")
+threhold = config["threshold"] * 10
+data_path = f"binary_graph_100_{config['stride']}_{threhold}_ratio.npy"
+if os.path.exists(data_path):
+    binary_graph = np.load(data_path)
 else:
+    os.makedirs(os.path.dirname(data_path) or ".", exist_ok=True)
     binary_graph = load_dataset(config)
-    np.save("binary_graph_100_ratio.npy", binary_graph)
+    np.save(data_path, binary_graph)
 
 num_graph_per_sub = binary_graph.shape[0] // config["num_subjects"]
 # train_indices, val_indices, test_indices = family_group(num_graph_per_sub)
-train_indices, val_indices, test_indices = split_by_ratio_per_sub(num_graph_per_sub)
+# train_indices, val_indices, test_indices = split_by_ratio_per_sub(num_graph_per_sub)
+train_indices, val_indices, test_indices = split_by_session(num_graph_per_sub // 4)
+
 #70% of 1200 + 
+print("binary_graph:", binary_graph.shape)
+print("num_graph_per_sub:", num_graph_per_sub)
 print("computing adaptive lookback:")
 adaptive_lookbacks = []
 for subject_idx in range(config["num_subjects"]):
@@ -134,14 +165,16 @@ binary_graph = padded_data
 data = binary_tensor_to_data_format(binary_graph)
 
 model = optimise_mamba(data,config)
+import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 dataset = RMDataset_adaptive(data, adaptive_lookbacks)
-#read the best_model.pt
+# read the best_model.pt
 # model.load_state_dict(torch.load('best_model.pth'))
 mu_timestamp = []
 sigma_timestamp = []
 
-save_path = f"./models/adaptive_lookback/{config['adaptive_type']}/model_100_ratio.pth"
+save_path = f"./models/adaptive_lookback/{config['adaptive_type']}/{config['max_lb']}/{config['stride']}/{threhold}/model_100_sess.pth"
 model = MambaG2G2(config["GDGMamba2"], config["GDGMamba2"]["d_model"], config["dim_out"], dropout=config["dropout"]).to(device)
 model.load_state_dict(torch.load(save_path))
 with torch.no_grad():
@@ -173,7 +206,7 @@ print("Mean MAP: ", np.mean(MAPS))
 print("Mean MRR: ", np.mean(MRR))
 print("Std MAP: ", np.std(MAPS))
 print("Std MRR: ", np.std(MRR))
-print("Time taken: ", time.time() - start)
+print("Time taken: ", (time.time() - start)/5 )
 
 
 
