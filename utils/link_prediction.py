@@ -62,6 +62,11 @@ def get_inf(data, mu_64, sigma_64, lookback,mult,train_indices):
     count = 0
     for ctr in train_indices[train_indices > lookback]:
 
+# s0: 0, ... 110; 111,... 221; 222 ... 443
+# s1: 444, ... 
+
+# train_indices: 0,...221,444, ...
+
         A_node = data[ctr][0].shape[0]
         A = data[ctr][0]
 
@@ -98,7 +103,7 @@ def get_inf(data, mu_64, sigma_64, lookback,mult,train_indices):
 
                 if ctr >= 0:
 
-                    a_embed = np.array(mu_64[ctr - lookback])[a.astype(int)]
+                    a_embed = np.array(mu_64[ctr - (lookback + 1)])[a.astype(int)]
 
                     a_embed_stacked = np.vstack(a_embed)  # This stacks all [0] and [1] vertically
 
@@ -177,7 +182,7 @@ def get_MAP_avg(mu_arr,sigma_arr,lookback,data,train_indices, test_indices):
     MRR_l = []
     time_list = [40, 41, 42, 43, 44, 45, 46, 47, 48, 49]
 
-    for l_num in range(len(L_list)):
+    for l_num in range(len(L_list)): # change to another name 
 
         mu_64 = mu_arr[l_num]
         sigma_64 = sigma_arr[l_num]

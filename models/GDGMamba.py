@@ -10,6 +10,8 @@ from ray import tune
 from ray import train, tune
 from ray.tune.search.optuna import OptunaSearch
 
+from utils.brain_info import *
+
 from torch.utils.data import Dataset, DataLoader
 from torch_geometric.utils import dense_to_sparse
 from torch_geometric.data import Data
@@ -40,7 +42,7 @@ from torch.nn import (
     Sequential,
 )
 
-from torch_geometric.nn import GINEConv, global_add_pool
+from torch_geometric.nn import GINEConv, GINConv,  global_add_pool
 import inspect
 from typing import Any, Dict, Optional
 
@@ -78,6 +80,9 @@ if torch.cuda.is_available():
 
 # Check GPU availability
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+df_atlas = load_atlas()
+meta = built_node_meta(map_roi_id_subnetwork(load_roi_dict(df_atlas)))
+print(meta)
 print(device)
 
 
@@ -100,6 +105,38 @@ def get_graph_data(x):
     batch = torch.zeros(x.size(0), dtype=torch.long)
 
     return x, edge_index, edge_attr, batch
+
+def get_graph_data_id(x):
+    """
+    x: numpy array or torch tensor of shape (N, N), adjacency matrix
+    node_meta: torch tensor of shape (N, 2), where each row is [hemisphere, subnetwork] for that node
+    """
+    edge_index_list = []
+    x = torch.tensor(x, dtype=torch.float32)
+    node_meta = torch.tensor(meta, dtype=torch.long)  # shape: [N, 2]
+
+    # Convert dense adjacency to edge_index and edge_attr
+    edge_index, edge_weight = dense_to_sparse(x)  # edge_index: [2, E], edge_weight: [E]
+    edge_index_list.append(edge_index)
+    edge_index = torch.cat(edge_index_list, dim=1)
+
+    # For each edge, look up source and target node attributes
+    source_nodes_roi = torch.tensor(index_to_roi_id(edge_index[0], df_atlas), dtype=torch.long)
+    target_nodes_roi = torch.tensor(index_to_roi_id(edge_index[1], df_atlas), dtype=torch.long)
+
+    # Get hemisphere and subnet info
+    source_meta = node_meta[source_nodes_roi - 1]  # shape: [E, 2]
+    target_meta = node_meta[target_nodes_roi - 1]  # shape: [E, 2]
+
+    # Combine: [source_hemi, source_subnet, target_hemi, target_subnet]
+    edge_attr = torch.cat([source_meta[:, 0:1],  # source hemisphere
+                           source_meta[:, 1:2],  # source subnet
+                           target_meta[:, 0:1],  # target hemisphere
+                           target_meta[:, 1:2]], dim=1)  # shape: [E, 4]
+
+    batch = torch.zeros(x.size(0), dtype=torch.long)
+
+    return x.to(device), edge_index.to(device), edge_attr.to(device), batch.to(device)
 
 
 # def val_loss(t):
@@ -163,16 +200,17 @@ class ApplyConv(torch.nn.Module):
         hs = []
         if self.conv is not None:
             h = self.conv(x, edge_index, edge_attr, **kwargs)
+            # h = self.conv(x, edge_index, **kwargs)
             h = F.dropout(h, p=self.dropout, training=self.training)
             h = h + x #96,96
             h = self.norm1(h)
             hs.append(h)
 
-        inp_mamba = x.reshape(1,x.size(0), x.size(1)) #1,96,96  Batch , time stamp , features
+        # inp_mamba = x.reshape(1,x.size(0), x.size(1)) #1,96,96  Batch , time stamp , features
 
-        h = self.mamba(inp_mamba)
-        h = h.mean(dim=0) #96,96
-        hs.append(h)
+        # h = self.mamba(inp_mamba) # 
+        # h = h.mean(dim=0) #96,96
+        # hs.append(h)
 
         out = sum(hs) #96,96
         return out
@@ -190,8 +228,8 @@ class MambaG2G1(torch.nn.Module):
 
         # Correctly instantiate GINEConv with the sequential model
         self.conv = ApplyConv(self.conv_mamba,dropout,dim_in, GINEConv(nn_model))
-
-        # self.enc_input_fc = nn.Linear(dim_in, dim_in)
+        # self.conv = ApplyConv(self.conv_mamba,dropout,dim_in, GINConv(nn_model))
+        # self.enc_input_fc = nn.Linear(dim_in, dim_in) 
         self.dropout = nn.Dropout(p=dropout)  # Add Dropout layer
         self.out_fc = nn.Linear(config['d_model'], self.D)  # Adjusted to match output dimension
         self.sigma_fc = nn.Linear(self.D, dim_out)
@@ -204,7 +242,8 @@ class MambaG2G1(torch.nn.Module):
         for i in range(input.size(1)):
             x = input[:, i, :]
             x, edge_index, edge_attr, batch = get_graph_data(x)
-            edge_attr = self.edge_emb(edge_attr.int())
+            # print(i,": ", edge_attr)
+            edge_attr = self.edge_emb(edge_attr.int()) # label hem/subnetwork
             x = self.conv(x,edge_index, batch=batch, edge_attr=edge_attr)
             z.append(x)
         z = torch.stack(z, 1)
@@ -256,6 +295,7 @@ class MambaG2G2(torch.nn.Module):
 
         # Correctly instantiate GINEConv with the sequential model
         self.conv = ApplyConv(self.conv_mamba,dropout,dim_in, GINEConv(nn_model))
+        # self.conv = ApplyConv(self.conv_mamba,dropout,dim_in, GINConv(nn_model))
 
         # self.enc_input_fc = nn.Linear(dim_in, dim_in)
         self.dropout = nn.Dropout(p=dropout)  # Add Dropout layer
@@ -263,34 +303,29 @@ class MambaG2G2(torch.nn.Module):
         self.sigma_fc = nn.Linear(self.D, dim_out)
         self.mu_fc = nn.Linear(self.D, dim_out)
         self.edge_emb = Embedding(2, dim_in)
+        self.hem_emb = nn.Embedding(2, 24)
+        self.subnet_emb = nn.Embedding(17, 24)
 
     def forward(self, input):
-        # e = self.enc_input_fc(input)
-        # print("input shape:", input.shape)
-        # pad_first = 96 - input.shape[0]  # = 4
-        # pad_last = 96 - input.shape[2]   # = 4
-
-        # # Pad first dimension (dim=0)
-        # pad_front = torch.zeros(pad_first, input.shape[1], input.shape[2], device="cuda")
-        # input = torch.cat([input, pad_front], dim=0)
-
-        # # Pad last dimension (dim=2)
-        # pad_end = torch.zeros(input.shape[0], input.shape[1], pad_last, device="cuda")
-        # input = torch.cat([input, pad_end], dim=2)
-
-        # print("Padded shape:", input.shape)
-
         z = []
         for i in range(input.size(1)):
             x = input[:, i, :]
-            x, edge_index, edge_attr, batch = get_graph_data(x)
-            edge_attr = self.edge_emb(edge_attr.int())
+            # x, edge_index, edge_attr, batch = get_graph_data(x)
+            # edge_attr = self.edge_emb(edge_attr.int())
+
+            x, edge_index, edge_attr, batch = get_graph_data_id(x) # edge_attr shape: [E, 4]
+            a1 = self.hem_emb(edge_attr[:, 0])
+            a2 = self.subnet_emb(edge_attr[:, 1])
+            b1 = self.hem_emb(edge_attr[:, 2])
+            b2 = self.subnet_emb(edge_attr[:, 3])
+            edge_attr = torch.concatenate([a1, a2, b1, b2], dim=1)
+            # print(edge_attr.shape)
             x = self.conv(x,edge_index, batch=batch, edge_attr=edge_attr)
             z.append(x)
         # print("z shape 1:", z.shape)
-        z = torch.stack(z, 1)
+        z = torch.stack(z, 1)  
         # print("z shape 2:", z.shape)
-        e = self.mamba(z)
+        e = self.mamba(z) # if lb is fixed: L N D; L_b N D; posi embedding+ self-attention + fixed lb
         # print("e shape after mamba:", e.shape)
         e = e.mean(dim=1)  # Average pooling to maintain the expected shape
         e = self.dropout(e)  # Apply dropout after average pooling

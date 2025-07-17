@@ -15,6 +15,28 @@ def set_seed(seed=42):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
+def compute_adaptive(binary_graph, num_graph_per_sub):
+    print("computing adaptive lookback:")
+    adaptive_lookbacks = []
+    for subject_idx in range(config["num_subjects"]):
+        start = subject_idx * num_graph_per_sub
+        end = start + num_graph_per_sub
+        subject_graphs = binary_graph[start:end]  # shape: (444, 92, 92)
+
+        lookbacks = []
+        session_size = num_graph_per_sub // 4
+        for i in range(4): 
+            session_graphs = subject_graphs[i * session_size: (i + 1) * session_size]
+            novelty_indices, _ = compute_novelty_index(session_graphs)  # list of len 111
+            session_lookbacks = [config["max_lb"]] + quantile_binning(novelty_indices[1:])
+            lookbacks.extend(session_lookbacks)
+            
+        adaptive_lookbacks.extend(lookbacks)
+    adaptive_lookbacks = np.array(adaptive_lookbacks)
+    print(adaptive_lookbacks[:100])
+    print("adaptive lookback computed over!")
+    return adaptive_lookbacks
+
 # ========================= Novelty Index Computation ========================= #
 
 def compute_novelty_index(dynfc_matrices):
@@ -54,7 +76,7 @@ def compute_novelty_index(dynfc_matrices):
 
 # ========================= Quantile Binning for Adaptive Lookback ========================= #
 
-def quantile_binning(novelties, min_lookback=0, max_lookback=config["max_lb"]):
+def quantile_binning(novelties, min_lookback=1, max_lookback=config["max_lb"]):
     """
     Map novelty indices to adaptive lookback values using quantile binning.
 

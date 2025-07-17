@@ -38,7 +38,7 @@ class RMDataset_adaptive(Dataset):
             session_start = (i // num_graph_per_session) * num_graph_per_session
             if i < session_start + config["max_lb"]:
                 adj_matr = data[i][0].todense()
-                B = np.zeros((config["dim_in"], lookback[i] + 1, config["dim_in"]))
+                B = np.zeros((config["dim_in"], 1, config["dim_in"]))
                 B[:adj_matr.shape[0], -1, :adj_matr.shape[1]] = adj_matr  # put it in the last frame
                 dataset[i] = torch.tensor(B).clone().detach().requires_grad_(True).to(device)
             else:
@@ -93,7 +93,7 @@ class RMDataset(Dataset):
         num_graph_per_session = (1200 - config["window_size"]) // config["stride"] + 1
         for i in range(lookback, len(data)):
             session_start = (i // num_graph_per_session) * num_graph_per_session
-            if i < session_start + lookback:
+            if i < session_start + lookback: # 
                 adj_matr = data[i][0].todense()
                 B = np.zeros((config["dim_in"], lookback + 1, config["dim_in"]))
                 B[:adj_matr.shape[0], -1, :adj_matr.shape[1]] = adj_matr  # put it in the last frame
@@ -243,7 +243,7 @@ def prepare_data_adaptive(dynfc_matrices, adaptive_lookbacks):
 
     return dataset, hop_dict, scale_terms_dict, triplet_dict, scale_dict
 
-def family_group(num_graph_per_subject):
+def remove_twins():
 
     twins_df = pd.read_csv(config["twins_path"], header=None)
     twins_matrix = twins_df.values  # numpy array
@@ -267,7 +267,7 @@ def family_group(num_graph_per_subject):
     for i, j, _ in related_pairs:
         related_subjects.add(i)
         related_subjects.add(j)
-
+    
     all_subjects = set(range(n_subjects))
     unrelated_subjects = list(all_subjects - related_subjects)
 
@@ -293,6 +293,35 @@ def family_group(num_graph_per_subject):
     for group_id, group in enumerate(family_groups):
         for idx in group:
             groups[idx] = group_id
+
+    return groups, family_groups
+
+def find_unrelated_in_range(groups, target_range=range(100, 300), max_count=100):
+    target_range = list(target_range)
+
+    group_to_subjects = {}
+    for i in target_range:
+        group_id = groups[i]
+        if group_id == -1:
+            continue
+        group_to_subjects.setdefault(group_id, []).append(i)
+
+    unrelated_subjects = []
+    for subject_list in group_to_subjects.values():
+        if len(subject_list) == 1:
+            unrelated_subjects.append(subject_list[0])
+            if len(unrelated_subjects) == max_count:
+                break
+
+    print(f"Found {len(unrelated_subjects)} unrelated subjects in range(100, 300):")
+    print(unrelated_subjects)
+
+    return unrelated_subjects
+
+
+def family_group(num_graph_per_subject):
+
+    _, family_groups = remove_twins()
 
     filtered_groups = []
     for group in family_groups:
